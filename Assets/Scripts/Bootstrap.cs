@@ -1,7 +1,9 @@
+using System;
+using System.Reflection;
 using UnityEngine;
-using Unity.MLAgents;                // for DecisionRequester
-using Unity.MLAgents.Policies;       // for BehaviorParameters, BehaviorType, InferenceDevice
-using Unity.MLAgents.Actuators;      // for ActionSpec
+using Unity.MLAgents;                // DecisionRequester
+using Unity.MLAgents.Policies;       // BehaviorParameters, BehaviorType, InferenceDevice
+using Unity.MLAgents.Actuators;      // ActionSpec (if available)
 
 public static class Bootstrap
 {
@@ -35,8 +37,17 @@ public static class Bootstrap
         bp.BehaviorName    = "DroneInterceptor";
         bp.InferenceDevice = InferenceDevice.CPU;
         bp.BehaviorType    = BehaviorType.Default;
-        bp.ActionSpec      = ActionSpec.MakeContinuous(3); // [pitch,yaw,thrust]
 
+        // Try modern API first: BehaviorParameters.ActionSpec (ML-Agents >= ~1.7)
+        bool configured = TrySetActionSpec(bp, 3);
+
+        // Fallback to legacy BrainParameters if present (older ML-Agents)
+        if (!configured) { configured = TrySetBrainParameters(bp, 3); }
+
+        // If neither API was available, at least make the build runnable (heuristic only).
+        if (!configured) { bp.BehaviorType = BehaviorType.HeuristicOnly; }
+
+        // Request regular decisions
         var requester = defenderGO.AddComponent<DecisionRequester>();
         requester.DecisionPeriod = 5;
         requester.TakeActionsBetweenDecisions = true;
@@ -53,5 +64,79 @@ public static class Bootstrap
         var cam = camGO.AddComponent<Camera>();
         cam.transform.position = new Vector3(0, 40, -60);
         cam.transform.LookAt(baseGO.transform);
+    }
+
+    // --- Helpers -------------------------------------------------------------
+
+    // Modern path: BehaviorParameters.ActionSpec = ActionSpec.MakeContinuous(n)
+    static bool TrySetActionSpec(BehaviorParameters bp, int nContinuous)
+    {
+        try
+        {
+            var prop = typeof(BehaviorParameters).GetProperty("ActionSpec",
+                BindingFlags.Public | BindingFlags.Instance);
+            if (prop == null) return false;
+
+            // Create ActionSpec via static MakeContinuous(int)
+            var make = typeof(ActionSpec).GetMethod("MakeContinuous",
+                BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(int) }, null);
+            if (make == null) return false;
+
+            var spec = make.Invoke(null, new object[] { nContinuous });
+            prop.SetValue(bp, spec);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // Legacy path: BehaviorParameters.BrainParameters.VectorActionSize / SpaceType
+    static bool TrySetBrainParameters(BehaviorParameters bp, int nContinuous)
+    {
+        try
+        {
+            var bpProp = typeof(BehaviorParameters).GetProperty("BrainParameters",
+                BindingFlags.Public | BindingFlags.Instance);
+            if (bpProp == null || !bpProp.CanWrite && !bpProp.CanRead) return false;
+
+            object brain = null;
+
+            // If read-only getter exists, try to clone/modify it; else create a new instance.
+            if (bpProp.CanRead)
+                brain = bpProp.GetValue(bp);
+
+            var brainType = brain?.GetType() ?? bpProp.PropertyType;
+            if (brain == null) brain = Activator.CreateInstance(brainType);
+
+            // SpaceType enum lives under Unity.MLAgents.Policies in older builds
+            var spaceType = brainType.Assembly.GetType("Unity.MLAgents.Policies.SpaceType")
+                            ?? brainType.Assembly.GetType("MLAgents.Policies.SpaceType");
+
+            // Try fields first (older versions used fields)
+            var fActType = brainType.GetField("VectorActionSpaceType", BindingFlags.Public | BindingFlags.Instance);
+            var fActSize = brainType.GetField("VectorActionSize",      BindingFlags.Public | BindingFlags.Instance);
+
+            if (fActType != null && fActSize != null && spaceType != null)
+            {
+                fActType.SetValue(brain, Enum.Parse(spaceType, "Continuous"));
+                fActSize.SetValue(brain, new int[] { nContinuous });
+                if (bpProp.CanWrite) bpProp.SetValue(bp, brain);
+                return true;
+            }
+
+            // Try properties (some mid versions used properties)
+            var pActType = brainType.GetProperty("VectorActionSpaceType", BindingFlags.Public | BindingFlags.Instance);
+            var pActSize = brainType.GetProperty("VectorActionSize",      BindingFlags.Public | BindingFlags.Instance);
+
+            if (pActType != null && pActType.CanWrite && pActSize != null && pActSize.CanWrite && spaceType != null)
+            {
+                pActType.SetValue(brain, Enum.Parse(spaceType, "Continuous"));
+                pActSize.SetValue(brain, new int[] { nContinuous });
+                if (bpProp.CanWrite) bpProp.SetValue(bp, brain);
+                return true;
+            }
+
+            return false;
+        }
+        catch { return false; }
     }
 }
