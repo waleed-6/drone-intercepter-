@@ -35,11 +35,8 @@ public static class Bootstrap
         bp.BehaviorName    = "DroneInterceptor";
         bp.InferenceDevice = InferenceDevice.CPU;
         bp.BehaviorType    = BehaviorType.Default;
+        bp.ActionSpec      = ActionSpec.MakeContinuous(3); // [pitch,yaw,thrust]
 
-        // Define a 3D continuous action space: [pitch, yaw, throttle]
-        bp.ActionSpec = ActionSpec.MakeContinuous(3);
-
-        // Request regular decisions
         var requester = defenderGO.AddComponent<DecisionRequester>();
         requester.DecisionPeriod = 5;
         requester.TakeActionsBetweenDecisions = true;
