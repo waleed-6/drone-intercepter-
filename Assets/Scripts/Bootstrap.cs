@@ -1,9 +1,7 @@
 using System;
 using System.Reflection;
 using UnityEngine;
-using Unity.MLAgents;                // DecisionRequester
-using Unity.MLAgents.Policies;       // BehaviorParameters, BehaviorType, InferenceDevice
-using Unity.MLAgents.Actuators;      // ActionSpec (if available)
+using Unity.MLAgents.Policies; // BehaviorParameters, BehaviorType, InferenceDevice
 
 public static class Bootstrap
 {
@@ -38,19 +36,17 @@ public static class Bootstrap
         bp.InferenceDevice = InferenceDevice.CPU;
         bp.BehaviorType    = BehaviorType.Default;
 
-        // Try modern API first: BehaviorParameters.ActionSpec (ML-Agents >= ~1.7)
-        bool configured = TrySetActionSpec(bp, 3);
+        // Try to define a 3D continuous action space in a version-agnostic way
+        bool configured = TrySetActionSpec(bp, 3) || TrySetBrainParameters(bp, 3);
+        if (!configured)
+        {
+            // Fall back so the build still runs (heuristic control only)
+            bp.BehaviorType = BehaviorType.HeuristicOnly;
+            Debug.LogWarning("[Bootstrap] Could not configure action space via ML-Agents API; falling back to HeuristicOnly.");
+        }
 
-        // Fallback to legacy BrainParameters if present (older ML-Agents)
-        if (!configured) { configured = TrySetBrainParameters(bp, 3); }
-
-        // If neither API was available, at least make the build runnable (heuristic only).
-        if (!configured) { bp.BehaviorType = BehaviorType.HeuristicOnly; }
-
-        // Request regular decisions
-        var requester = defenderGO.AddComponent<DecisionRequester>();
-        requester.DecisionPeriod = 5;
-        requester.TakeActionsBetweenDecisions = true;
+        // DecisionRequester (optional; add only if the type exists)
+        TryAddDecisionRequester(defenderGO, decisionPeriod: 5, takeBetween: true);
 
         // ---- Game manager ----
         var gmGO = new GameObject("GameManager");
@@ -68,75 +64,92 @@ public static class Bootstrap
 
     // --- Helpers -------------------------------------------------------------
 
-    // Modern path: BehaviorParameters.ActionSpec = ActionSpec.MakeContinuous(n)
+    // Modern: BehaviorParameters.ActionSpec = ActionSpec.MakeContinuous(n)
     static bool TrySetActionSpec(BehaviorParameters bp, int nContinuous)
     {
         try
         {
-            var prop = typeof(BehaviorParameters).GetProperty("ActionSpec",
-                BindingFlags.Public | BindingFlags.Instance);
+            var bpType = typeof(BehaviorParameters);
+            var prop = bpType.GetProperty("ActionSpec", BindingFlags.Public | BindingFlags.Instance);
             if (prop == null) return false;
 
-            // Create ActionSpec via static MakeContinuous(int)
-            var make = typeof(ActionSpec).GetMethod("MakeContinuous",
+            var actionSpecType = Type.GetType("Unity.MLAgents.Actuators.ActionSpec, Unity.MLAgents");
+            if (actionSpecType == null) return false;
+
+            var make = actionSpecType.GetMethod("MakeContinuous",
                 BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(int) }, null);
             if (make == null) return false;
 
             var spec = make.Invoke(null, new object[] { nContinuous });
             prop.SetValue(bp, spec);
+            Debug.Log("[Bootstrap] Set ActionSpec continuous=" + nContinuous);
             return true;
         }
         catch { return false; }
     }
 
-    // Legacy path: BehaviorParameters.BrainParameters.VectorActionSize / SpaceType
+    // Legacy: BehaviorParameters.BrainParameters.VectorActionSize/SpaceType
     static bool TrySetBrainParameters(BehaviorParameters bp, int nContinuous)
     {
         try
         {
-            var bpProp = typeof(BehaviorParameters).GetProperty("BrainParameters",
-                BindingFlags.Public | BindingFlags.Instance);
-            if (bpProp == null || !bpProp.CanWrite && !bpProp.CanRead) return false;
+            var bpType = typeof(BehaviorParameters);
+            var bpProp = bpType.GetProperty("BrainParameters", BindingFlags.Public | BindingFlags.Instance);
+            if (bpProp == null) return false;
 
-            object brain = null;
-
-            // If read-only getter exists, try to clone/modify it; else create a new instance.
-            if (bpProp.CanRead)
-                brain = bpProp.GetValue(bp);
-
+            object brain = bpProp.CanRead ? bpProp.GetValue(bp) : null;
             var brainType = brain?.GetType() ?? bpProp.PropertyType;
             if (brain == null) brain = Activator.CreateInstance(brainType);
 
-            // SpaceType enum lives under Unity.MLAgents.Policies in older builds
+            // SpaceType enum (location varies by version)
             var spaceType = brainType.Assembly.GetType("Unity.MLAgents.Policies.SpaceType")
-                            ?? brainType.Assembly.GetType("MLAgents.Policies.SpaceType");
+                           ?? brainType.Assembly.GetType("MLAgents.Policies.SpaceType");
+            if (spaceType == null) return false;
 
-            // Try fields first (older versions used fields)
-            var fActType = brainType.GetField("VectorActionSpaceType", BindingFlags.Public | BindingFlags.Instance);
-            var fActSize = brainType.GetField("VectorActionSize",      BindingFlags.Public | BindingFlags.Instance);
-
-            if (fActType != null && fActSize != null && spaceType != null)
+            // Fields (older)…
+            var fType = brainType.GetField("VectorActionSpaceType", BindingFlags.Public | BindingFlags.Instance);
+            var fSize = brainType.GetField("VectorActionSize",      BindingFlags.Public | BindingFlags.Instance);
+            if (fType != null && fSize != null)
             {
-                fActType.SetValue(brain, Enum.Parse(spaceType, "Continuous"));
-                fActSize.SetValue(brain, new int[] { nContinuous });
+                fType.SetValue(brain, Enum.Parse(spaceType, "Continuous"));
+                fSize.SetValue(brain, new int[] { nContinuous });
                 if (bpProp.CanWrite) bpProp.SetValue(bp, brain);
+                Debug.Log("[Bootstrap] Set BrainParameters via fields continuous=" + nContinuous);
                 return true;
             }
 
-            // Try properties (some mid versions used properties)
-            var pActType = brainType.GetProperty("VectorActionSpaceType", BindingFlags.Public | BindingFlags.Instance);
-            var pActSize = brainType.GetProperty("VectorActionSize",      BindingFlags.Public | BindingFlags.Instance);
-
-            if (pActType != null && pActType.CanWrite && pActSize != null && pActSize.CanWrite && spaceType != null)
+            // …or properties (newer legacy)
+            var pType = brainType.GetProperty("VectorActionSpaceType", BindingFlags.Public | BindingFlags.Instance);
+            var pSize = brainType.GetProperty("VectorActionSize",      BindingFlags.Public | BindingFlags.Instance);
+            if (pType != null && pType.CanWrite && pSize != null && pSize.CanWrite)
             {
-                pActType.SetValue(brain, Enum.Parse(spaceType, "Continuous"));
-                pActSize.SetValue(brain, new int[] { nContinuous });
+                pType.SetValue(brain, Enum.Parse(spaceType, "Continuous"));
+                pSize.SetValue(brain, new int[] { nContinuous });
                 if (bpProp.CanWrite) bpProp.SetValue(bp, brain);
+                Debug.Log("[Bootstrap] Set BrainParameters via properties continuous=" + nContinuous);
                 return true;
             }
 
             return false;
         }
         catch { return false; }
+    }
+
+    // Add DecisionRequester if present in this ML-Agents version
+    static void TryAddDecisionRequester(GameObject go, int decisionPeriod, bool takeBetween)
+    {
+        try
+        {
+            var drType = Type.GetType("Unity.MLAgents.DecisionRequester, Unity.MLAgents");
+            if (drType == null) return;
+
+            var comp = go.AddComponent(drType);
+            var pPeriod = drType.GetProperty("DecisionPeriod");
+            var pTake   = drType.GetProperty("TakeActionsBetweenDecisions");
+            if (pPeriod != null && pPeriod.CanWrite) pPeriod.SetValue(comp, decisionPeriod);
+            if (pTake   != null && pTake.CanWrite)   pTake.SetValue(comp, takeBetween);
+            Debug.Log("[Bootstrap] DecisionRequester attached.");
+        }
+        catch { /* no-op if missing */ }
     }
 }
